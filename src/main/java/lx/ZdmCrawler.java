@@ -151,9 +151,9 @@ public class ZdmCrawler {
         blackWords.removeIf(StringUtils::isBlank);
 
         //白词过滤内容
-        //HashSet<String> whiteWords = Utils.readFile("./white_words.txt");
-        String secretContent = System.getenv("WHITE_WORDS_SECRET"); //获取sceret环境变量
-        HashSet<String> whiteWords = new HashSet<>(Arrays.asList(secretContent.split(","))); //","分隔，获取白名单过滤内容
+        HashSet<String> whiteWords = Utils.readFile("./white_words.txt");
+        //String secretContent = System.getenv("WHITE_WORDS_SECRET"); //获取sceret环境变量
+        //HashSet<String> whiteWords = new HashSet<>(Arrays.asList(secretContent.split(","))); //","分隔，获取白名单过滤内容
         whiteWords.removeIf(StringUtils::isBlank);
 
         if (whiteWords.isEmpty()) {
