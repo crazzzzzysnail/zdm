@@ -1,11 +1,6 @@
 package lx;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
+import java.net.HttpCookie;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -21,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.TimeZone;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -33,13 +29,19 @@ import javax.mail.internet.InternetAddress;
 import javax.mail.internet.MimeMessage;
 
 import org.apache.commons.lang3.StringUtils;
+import org.openqa.selenium.Cookie;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
 
 import com.alibaba.fastjson.JSONObject;
 import com.google.common.collect.Lists;
 
 import cn.hutool.core.io.IORuntimeException;
+import cn.hutool.core.thread.ThreadUtil;
 import cn.hutool.http.ContentType;
 import cn.hutool.http.HttpException;
+import cn.hutool.http.HttpRequest;
 import cn.hutool.http.HttpUtil;
 import lx.mapper.ZdmMapper;
 import lx.model.Zdm;
@@ -52,11 +54,11 @@ import static lx.utils.Const.ZDM_URL;
 public class ZdmCrawler {
 
     public static void main(String[] args) {
-        //突然发现定环境变量名的时候一下子大写下划线,一下子小写驼峰. 考虑到之前已经有在用的用户了, 暂时不做修改了
+        //突然发现定环境变量名的时候一下子大写下划线,一下子小写驼峰. 考虑到之前已经有在用的用户了, 暂时不做修改
         Map<String, String> envMap = System.getenv();
         String emailHost = System.getenv("emailHost"), emailAccount = System.getenv("emailAccount"),
                 emailPassword = System.getenv("emailPassword"), emailPort = envMap.getOrDefault("emailPort", "465"),
-                spt = System.getenv("spt");
+                spt = System.getenv("spt"), cookie = System.getenv("cookie");
         int maxPageSize = Integer.parseInt(envMap.getOrDefault("maxPageSize", "20")),
                 minVoted = Integer.parseInt(envMap.getOrDefault("minVoted", "0")),
                 minComments = Integer.parseInt(envMap.getOrDefault("minComments", "0")),
@@ -64,7 +66,7 @@ public class ZdmCrawler {
         boolean detail = "true".equals(envMap.getOrDefault("detail", "false"));
 
         //获取待推送的优惠信息
-        Collection<Zdm> zdms = obtainUnpushedArticles(maxPageSize);
+        Collection<Zdm> zdms = obtainUnpushedArticles(maxPageSize, cookie);
 
         //根据各项规则执行过滤逻辑
         zdms = processFilter(zdms, minVoted, minComments, detail);
@@ -93,7 +95,7 @@ public class ZdmCrawler {
         });
     }
 
-    private static Collection<Zdm> obtainUnpushedArticles(int maxPageSize) {
+    private static Collection<Zdm> obtainUnpushedArticles(int maxPageSize, String cookie) {
         //GitHub Actions部署的服务器一般在海外,调整为东八区的时区
         ZoneId zoneId = ZoneId.of("GMT+8");
         TimeZone.setDefault(TimeZone.getTimeZone(zoneId));
@@ -101,24 +103,23 @@ public class ZdmCrawler {
         //上次执行后未推送的优惠信息
         List<Zdm> unPush = ZdmMapper.unPush();
 
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
+        /**
+         * 什么值得买的cookie在未登录的状态下是由'__ckguid','x-waf-captcha-referer','w_tsfp'三段组成的
+         * __ckguid是响应头的set-cookie里取下来的, x-waf-captcha-referer固定为空, w_tsfp是靠访问probe.js动态生成
+         * 这里支持从selenium模拟浏览器行为自动获取cookie,也支持在环境变量里自定义固定的cookie值
+         */
+        HttpRequest request = HttpUtil.createGet("url").contentType(ContentType.JSON.getValue());
+        if (StringUtils.isNotBlank(cookie))
+            request.header("cookie", cookie);
+        else
+            request.cookie(buildCookies());
 
         //从网页上获取的优惠信息
         Stream<Zdm> crawled = ZDM_URL.stream().flatMap(url -> {
             List<Zdm> zdmPage = new ArrayList<>();
             for (int i = 1; i <= maxPageSize; i++) {
                 try {
-                    /**
-                     * 2025-05-08 什么值得买的这个接口似乎加了反爬虫机制,偶尔会返回一段js的验证码,导致JSONObject解析json时报错
-                     * 分别尝试了cn.hutool.http.HttpUtil 和 java.net.http.HttpRequest两个接口调用工具,发现HttpUtil会出现上述问题,可能是这两种调用方式生成的请求头有所不同导致的?
-                     * 总之不太清楚是触发了什么反爬虫的规则.有懂哥可以帮忙看看
-                     */
-                    HttpRequest httpRequest = HttpRequest.newBuilder().GET().uri(URI.create(url + i)).build();
-                    String s = client.send(httpRequest, HttpResponse.BodyHandlers.ofString()).body();
-
+                    String s = request.setUrl(url + i).execute().body();
                     List<Zdm> zdmPart = JSONObject.parseArray(s, Zdm.class);
                     zdmPart.forEach(zdm -> {
                         //评论和点值数量的值后面会跟着'k','w'这种字符,将它们转换一下方便后面过滤和排序
@@ -132,7 +133,9 @@ public class ZdmCrawler {
                                 .toLocalDateTime().toString());
                     });
                     zdmPage.addAll(zdmPart);
-                } catch (IORuntimeException | HttpException | IOException | InterruptedException e) {
+                    //翻页的间隔时间(毫秒)
+                    ThreadUtil.sleep(ThreadLocalRandom.current().nextInt(100, 1001));
+                } catch (IORuntimeException | HttpException e) {
                     //暂时的网络不通,会导致连接超时的异常,等待下次运行即可
                     System.out.println("pageNumber:" + i + ", connect to zdm server timeout:" + e.getMessage());
                 }
@@ -245,5 +248,26 @@ public class ZdmCrawler {
         if (!"1000".equals(code))
             throw new RuntimeException("WxPusher推送失败:" + jsonObject.getString("msg"));
         return true;
+    }
+
+    private static Collection<HttpCookie> buildCookies() {
+        ChromeOptions options = new ChromeOptions();
+        options.addArguments("--headless");          // 无头模式
+        options.addArguments("--disable-gpu");      // 禁用 GPU 加速（Linux 必备）
+        options.addArguments("--no-sandbox");       // 禁用沙盒（CI 环境必备）
+        options.addArguments("--disable-dev-shm-usage"); // 避免 /dev/shm 不足
+
+        WebDriver driver = new ChromeDriver(options);
+        driver.get("https://faxian.smzdm.com/json_more");
+        Collection<HttpCookie> cookies = new ArrayList<>();
+        cookies.add(new HttpCookie("x-waf-captcha-referer", ""));
+        Cookie ckguid = driver.manage().getCookieNamed("__ckguid");
+        if (ckguid != null)
+            cookies.add(new HttpCookie("__ckguid", ckguid.getValue()));
+        Cookie w_tsfp = driver.manage().getCookieNamed("w_tsfp");
+        if (w_tsfp != null)
+            cookies.add(new HttpCookie("w_tsfp", w_tsfp.getValue()));
+        driver.quit();
+        return cookies;
     }
 }
